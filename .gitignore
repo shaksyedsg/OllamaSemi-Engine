@@ -7,3 +7,4 @@ explainer/
 # DuckDB local database files
 *.db
 *.db-wal
+*.json
