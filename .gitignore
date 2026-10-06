@@ -1,3 +1,9 @@
 /target
 *.std
 *.stdf
+gitnotes
+gitnotes.*
+explainer/
+# DuckDB local database files
+*.db
+*.db-wal

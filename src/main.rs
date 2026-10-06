@@ -1,90 +1,133 @@
+use duckdb::{params, Connection};
 use rust_stdf::stdf_file::StdfReader;
 use rust_stdf::StdfRecord;
 use std::env;
 use std::time::Instant;
 
-fn main() {
-    // 1. Read file path passed from command line
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. READ COMMAND LINE ARGUMENTS
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         println!("❌ Error: Please provide an STDF file path.");
-        println!("Usage: cargo run --release -- <path_to_your_stdf_file>");
-        return;
+        println!("Usage: cargo run --release -- <path_to_stdf_file>");
+        return Ok(());
     }
     let file_path = &args[1];
 
     println!("🚀 Opening STDF File: {}", file_path);
     let start_time = Instant::now();
 
-    // 2. Open the STDF Reader using StdfReader::new
+    // 2. INITIALIZE DUCKDB WITH DISK PERSISTENCE
+    let conn = Connection::open("stdf_analytics.db")?;
+
+    // Create database tables if they don't exist yet
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS lots (
+            lot_id TEXT,
+            device TEXT,
+            operator TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS parametric_tests (
+            test_num INTEGER,
+            test_name TEXT,
+            result DOUBLE,
+            test_flag INTEGER,
+            is_fail BOOLEAN
+        );
+        ",
+    )?;
+
+    // 3. OPEN STDF PARSER
     let mut reader = match StdfReader::new(file_path) {
         Ok(r) => r,
         Err(err) => {
             println!("❌ Failed to open STDF file: {}", err);
-            return;
+            return Ok(());
         }
     };
 
-    // Counters to measure results
+    // Prepare DuckDB Appender for high-speed batching
+    let mut ptr_appender = conn.appender("parametric_tests")?;
+
     let mut total_records = 0u64;
     let mut ptr_count = 0u64;
-    let mut pass_count = 0u64;
-    let mut fail_count = 0u64;
 
-    // 3. Iterate over binary records using get_record_iter()
+    // 4. STREAM PARSE & APPEND TO DUCKDB
     for record in reader.get_record_iter() {
         total_records += 1;
 
         match record {
-            // Master Information Record (MIR) - Lot Details
+            // Master Information Record (MIR)
             Ok(StdfRecord::MIR(mir)) => {
-                println!("\n=================================");
-                println!("📌 Lot ID:   {}", mir.lot_id);
-                println!("📌 Device:   {}", mir.part_typ);
-                println!("📌 Operator: {}", mir.oper_nam);
-                println!("=================================\n");
+                conn.execute(
+                    "INSERT INTO lots (lot_id, device, operator) VALUES (?, ?, ?)",
+                    params![mir.lot_id, mir.part_typ, mir.oper_nam],
+                )?;
             }
 
-            // Parametric Test Record (PTR) - Test Measurements
+            // Parametric Test Record (PTR)
             Ok(StdfRecord::PTR(ptr)) => {
                 ptr_count += 1;
 
-                // Extract single byte flag from array [u8; 1]
-                let test_flag_byte = ptr.test_flg[0];
+                let flag_byte = ptr.test_flg[0];
+                let is_fail = (flag_byte & 0b1100_0000) != 0;
 
-                // Bit 6 or Bit 7 set in test_flg flags errors/fails
-                if test_flag_byte & 0b1100_0000 != 0 {
-                    fail_count += 1;
-                } else {
-                    pass_count += 1;
-                }
-
-                // Print first 3 test measurements as a preview
-                if ptr_count <= 3 {
-                    println!(
-                        "Test #{}: Name='{}' | Result={:.4} | Flag=0x{:02X}",
-                        ptr.test_num, ptr.test_txt, ptr.result, test_flag_byte
-                    );
-                }
+                // Stream record directly to columnar buffer
+                ptr_appender.append_row(params![
+                    ptr.test_num,
+                    ptr.test_txt,
+                    ptr.result,
+                    flag_byte,
+                    is_fail
+                ])?;
             }
 
-            // Ignore record parse errors or unhandled record types
             _ => {}
         }
     }
 
-    let duration = start_time.elapsed();
+    // Flush all batched memory blocks directly to disk
+    ptr_appender.flush()?;
 
-    // 4. Output performance metrics
-    println!("\n✅ --- PARSING COMPLETE ---");
-    println!("⏱  Time Taken:     {:.3?}", duration);
-    println!("📦 Total Records:  {}", total_records);
-    println!("📊 PTR Records:    {}", ptr_count);
-    println!("✅ Passed Tests:   {}", pass_count);
-    println!("❌ Failed Tests:   {}", fail_count);
+    let parse_duration = start_time.elapsed();
+    println!("✅ Ingestion into 'stdf_analytics.db' completed in {:.3?}", parse_duration);
 
-    if duration.as_secs_f64() > 0.0 {
-        let speed = (total_records as f64) / duration.as_secs_f64();
-        println!("⚡ Parsing Speed:  {:.2} records/sec", speed);
+    // 5. RUN SQL ANALYTICS ON DISK DATABASE
+    println!("\n📊 --- DUCKDB DISK ANALYTICAL SUMMARY ---");
+
+    // Query Lot Info
+    let mut lot_stmt = conn.prepare("SELECT lot_id, device, operator FROM lots LIMIT 1")?;
+    let mut lot_rows = lot_stmt.query([])?;
+    if let Some(row) = lot_rows.next()? {
+        let lot_id: String = row.get(0)?;
+        let device: String = row.get(1)?;
+        let operator: String = row.get(2)?;
+        println!("📌 Device: {} | Operator: {} | Lot ID: '{}'", device, operator, lot_id);
     }
+
+    // Query Test Summary
+    let mut summary_stmt = conn.prepare(
+        "SELECT 
+            COUNT(*) as total,
+            COUNT(CASE WHEN is_fail = false THEN 1 END) as passed,
+            COUNT(CASE WHEN is_fail = true THEN 1 END) as failed
+         FROM parametric_tests",
+    )?;
+
+    let mut summary_rows = summary_stmt.query([])?;
+    if let Some(row) = summary_rows.next()? {
+        let total: i64 = row.get(0)?;
+        let passed: i64 = row.get(1)?;
+        let failed: i64 = row.get(2)?;
+
+        println!("📦 Total PTR Rows Saved: {}", total);
+        println!("✅ Passed PTR Measurements: {}", passed);
+        println!("❌ Failed PTR Measurements: {}", failed);
+        println!("📦 Total Records Tracked by Rust: {}", total_records);
+        println!("📦 Total PTR Counts by Rust: {}", ptr_count);
+    }
+
+    Ok(())
 }
